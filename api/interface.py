@@ -24,6 +24,7 @@ from ppq.quantization.optim.base import QuantizationOptimizationPass
 from ppq.quantization.quantizer import BaseQuantizer
 from ppq.scheduler import DISPATCHER_TABLE, GraphDispatcher
 
+import accelerate
 
 def load_graph(file_path: str, from_framework: NetworkFramework=NetworkFramework.ONNX, **kwargs) -> BaseGraph:
     parser = PFL.Parser(from_framework)
@@ -170,16 +171,26 @@ def dump_torch_to_onnx(
     # set model to eval mode, stabilize normalization weights.
     assert isinstance(model, torch.nn.Module), (
         f'Model must be instance of torch.nn.Module, however {type(model)} is given.')
+    # device = 'cpu'
+    # model = accelerate.cpu_offload(model,execution_device='cuda:0')
     model.eval()
 
     if inputs is None:
         dummy_input = torch.zeros(size=input_shape, device=device, dtype=input_dtype)
     else: dummy_input = inputs
 
+    # dummy_output = model(dummy_input)
+    # print([ key for key in dummy_output ], "GPU in dump")
+
+    # GPUtil.showUtilization(all=True)
     # print("dummy_input",dummy_input)
+    # print(model,model.hf_device_map)
+    # torch.cuda.empty_cache()
+    # model = model.half()
     if inputs is not None:
-        input_names = ['input_ids', 'attention_mask', 'token_type_ids'][:len(inputs)]
-        # print(input_names)
+        # input_names = ['input_ids', 'attention_mask', 'token_type_ids'][:len(inputs)]
+        input_names = [k for k in inputs]
+        print(input_names)
         torch.onnx.export(
             model=model, args=dummy_input, input_names = input_names,
             verbose=False, f=onnx_export_file, opset_version=11,
@@ -267,7 +278,9 @@ def quantize_onnx_model(
     else: dummy_input = inputs
 
     quantizer = PFL.Quantizer(platform, ppq_ir)
+    # GPUtil.showUtilization(all=True)
     executor = TorchExecutor(graph=quantizer._graph, device=device)
+    # executor = TorchExecutor(graph=quantizer._graph, device='cpu')
     if do_quantize:
         quantizer.quantize(
             inputs=dummy_input,
@@ -348,6 +361,9 @@ def quantize_torch_model(
     dump_torch_to_onnx(model=model, onnx_export_file=onnx_export_file,
         input_shape=input_shape, input_dtype=input_dtype,
         inputs=inputs, device=device)
+    
+    # print("device",device)
+    # return
 
     return quantize_onnx_model(onnx_import_file=onnx_export_file,
         calib_dataloader=calib_dataloader, calib_steps=calib_steps, collate_fn=collate_fn,
@@ -686,7 +702,6 @@ def dispatch_graph(
         quant_platform=TargetPlatform.UNSPECIFIED, # MUST BE UNSPECIFIED, 这里的意思是交由 Quantizer 决定是否量化这个算子
         fp32_platform=TargetPlatform.FP32,
         SOI_platform=TargetPlatform.SOI)
-    # print("==============original dispatching_table===============",dispatching_table)
 
     # override dispatching result
     if dispatching_override is not None:
@@ -701,8 +716,6 @@ def dispatch_graph(
                 'All platform setting given in dispatching table is expected given as int, '
                 f'however {type(platform)} was given.')
             dispatching_table[opname] = TargetPlatform(platform)
-    
-    # print("==============override dispatching_table===============",dispatching_table)
 
     for operation in graph.operations.values():
         assert operation.name in dispatching_table, (

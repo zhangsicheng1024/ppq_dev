@@ -1,3 +1,5 @@
+import os
+os.environ['TRANSFORMERS_CACHE'] = '/mnt/cache/huggingface/'
 import torchvision
 from ppq import *
 from ppq.api import *
@@ -25,8 +27,10 @@ import numpy as np
 import torch
 from transformers.models.opt.modeling_opt import OPTAttention, OPTDecoderLayer, OPTForCausalLM
 from transformers import GPT2Tokenizer
+import transformers
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import gc
 
 # PPQ_CONFIG.PPQ_DEBUG=True
 
@@ -54,14 +58,19 @@ QUANT_SETTING = QuantizationSettingFactory.default_setting() # 用来指定量�
 # QUANT_SETTING.lsq_optimization_setting.is_scale_trainable = True
 # QUANT_SETTING.lsq_optimization_setting.collecting_device  = 'cpu'
 model_list=[
-    'facebook/opt-125m',
-    'facebook/opt-350m',
-    'facebook/opt-1.3b',
+    # 'facebook/opt-125m',
+    # 'facebook/opt-350m',
+    # 'facebook/opt-1.3b',
     # 'facebook/opt-2.7b',
-    # 'facebook/opt-6.7b',
+    'facebook/opt-6.7b',
     # 'facebook/opt-13b',
     # 'facebook/opt-30b',
     # 'facebook/opt-66b',
+
+    # "decapoda-research/llama-7b-hf",
+    # "decapoda-research/llama-13b-hf",
+    # "decapoda-research/llama-30b-hf",
+    # "decapoda-research/llama-65b-hf",
 ]
 # seq = ["input_ids", "attention_mask", "token_type_ids", 
 #         "position_ids", "head_mask", "inputs_embeds", 
@@ -125,75 +134,126 @@ with ENABLE_CUDA_KERNEL():
         print(len(dataset),dataset[0])
 
         for model_checkpoint in model_list:
-            model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32).cuda()
+            # model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32, device_map="auto") 
 
             """Preprocessing the data"""
-            tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, use_fast=False)
-            evaluator = Evaluator(dataset, tokenizer, 'cuda')
+            # tokenizer = transformers.LlamaTokenizer.from_pretrained(model_checkpoint)
+            # tokenizer.pad_token = "[PAD]"
+            # model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32, device_map="auto") #.cuda()
+            model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32).cuda()
+            # print(model_fp16.hf_device_map)
+            # model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32).cuda()
 
-            """Eval the original model"""
-            acc_fp16 = evaluator.evaluate(model_fp16)
-            tp1_acc[model_checkpoint]=' * FP16 PREC {top1} '.format(top1=acc_fp16)
-            print(model_checkpoint,tp1_acc[model_checkpoint])
+            if "llama" in model_checkpoint:
+                tokenizer = transformers.LlamaTokenizer.from_pretrained(model_checkpoint, use_fast=False)
+                tokenizer.pad_token = "[PAD]"
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, use_fast=False)
+            evaluator = Evaluator(dataset, tokenizer, CFG_DEVICE)
 
-            """quantize"""
+            # """Eval the original model"""
+            # acc_fp16 = evaluator.evaluate(model_fp16)
+            # tp1_acc[model_checkpoint]=' * FP16 PREC {top1} '.format(top1=acc_fp16)
+            # print(model_checkpoint,tp1_acc[model_checkpoint])
+
             for batch in evaluator.dataset:
                 break
             input_ids = batch['input_ids'].to(CFG_DEVICE).unsqueeze(0)
-            ppq_quant_ir_INT8 = quantize_torch_model(
-                model=model_fp16, calib_dataloader=evaluator.dataset.shuffle(seed=29).select(range(100)), input_shape=input_ids.shape, input_dtype=input_ids.dtype,
-                # model=model_fp16, calib_dataloader=evaluator.dataset, input_shape=input_ids.shape, input_dtype=input_ids.dtype,
-                calib_steps=100, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), verbose=1,
-                device=CFG_DEVICE, platform=CFG_PLATFORM_INT8, setting=QUANT_SETTING)
-            ppq_quant_ir_FP8 = quantize_torch_model(
-                model=model_fp16, calib_dataloader=evaluator.dataset.shuffle(seed=29).select(range(100)), input_shape=input_ids.shape, input_dtype=input_ids.dtype,
-                # model=model_fp16, calib_dataloader=evaluator.dataset, input_shape=input_ids.shape, input_dtype=input_ids.dtype,
-                calib_steps=100, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), verbose=1,
-                device=CFG_DEVICE, platform=CFG_PLATFORM_FP8, setting=QUANT_SETTING)
 
-            # """evaluate"""
-            # executor = TorchExecutor(graph=ppq_quant_ir_INT8, device=CFG_DEVICE)
-            # model_forward_function = lambda input_tensor: torch.tensor(
-            #     executor(*[input_tensor])[0])
-            # acc_int8 = evaluator.evaluate_ppq(model_forward_function)
+            """quantize int"""
+            if os.path.exists(model_checkpoint[-6:]+'_layer_int8_aligned_v2.npy') and False:
+                reports_int8 = np.load(model_checkpoint[-6:]+'_layer_int8_aligned_v2.npy',allow_pickle=True)
+                reports_int8 = reports_int8.item()
+            else:
+                ppq_quant_ir_INT8 = quantize_torch_model(
+                    model=model_fp16, calib_dataloader=evaluator.dataset.shuffle(seed=29).select(range(100)), input_shape=input_ids.shape, input_dtype=input_ids.dtype,
+                    # model=model_fp16, calib_dataloader=evaluator.dataset, input_shape=input_ids.shape, input_dtype=input_ids.dtype,
+                    calib_steps=100, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), verbose=1,
+                    device=CFG_DEVICE, platform=CFG_PLATFORM_INT8, setting=QUANT_SETTING)
+                reports_int8 = layerwise_error_analyse_v2(
+                    graph=ppq_quant_ir_INT8, running_device=CFG_DEVICE, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), 
+                    dataloader=evaluator.dataset, method='mse')
+                np.save(model_checkpoint[-6:]+'_layer_int8_aligned_v2',reports_int8)
+                """evaluate"""
+                executor = TorchExecutor(graph=ppq_quant_ir_INT8, device=CFG_DEVICE)
+                model_forward_function = lambda input_tensor: torch.tensor(
+                    executor(*[input_tensor])[0])
+                acc_int8 = evaluator.evaluate_ppq(model_forward_function)
+                tp1_acc[model_checkpoint]=' *  INT8 PREC {top5}'.format(top5=acc_int8)
+                # tp1_acc[model_checkpoint]=' * INT8 PREC {top1} FP8 PREC {top3} MIX PREC {top5}'.format(top1=acc_int8, top3=acc_fp8 ,top5=acc_mix8)
+                print(model_checkpoint,tp1_acc[model_checkpoint])
 
-            # executor = TorchExecutor(graph=ppq_quant_ir_FP8, device=CFG_DEVICE)
-            # model_forward_function = lambda input_tensor: torch.tensor(
-            #     executor(*[input_tensor])[0])
-            # acc_fp8 = evaluator.evaluate_ppq(model_forward_function)
+                del model_forward_function
+                del ppq_quant_ir_INT8
+                del executor
+                gc.collect()
+                torch.cuda.empty_cache()
+ 
+            """quantize fp"""
+            if os.path.exists(model_checkpoint[-6:]+'_layer_fp8_v2.npy') and False:
+                reports_fp8 = np.load(model_checkpoint[-6:]+'_layer_fp8_v2.npy',allow_pickle=True)
+                reports_fp8 = reports_fp8.item()
+            else:
+                ppq_quant_ir_FP8 = quantize_torch_model(
+                    model=model_fp16, calib_dataloader=evaluator.dataset.shuffle(seed=29).select(range(100)), input_shape=input_ids.shape, input_dtype=input_ids.dtype,
+                    # model=model_fp16, calib_dataloader=evaluator.dataset, input_shape=input_ids.shape, input_dtype=input_ids.dtype,
+                    calib_steps=100, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), verbose=1,
+                    device=CFG_DEVICE, platform=CFG_PLATFORM_FP8, setting=QUANT_SETTING)
+                reports_fp8 = layerwise_error_analyse_v2(
+                    graph=ppq_quant_ir_FP8, running_device=CFG_DEVICE, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), 
+                    dataloader=evaluator.dataset, method='mse') 
+                np.save(model_checkpoint[-6:]+'_layer_fp8_v2',reports_fp8)  
+                """evaluate"""
+                executor = TorchExecutor(graph=ppq_quant_ir_FP8, device=CFG_DEVICE)
+                model_forward_function = lambda input_tensor: torch.tensor(
+                    executor(*[input_tensor])[0])
+                acc_fp8 = evaluator.evaluate_ppq(model_forward_function)
+                tp1_acc[model_checkpoint]=' *  FP8 PREC {top5}'.format(top5=acc_fp8)
+                # tp1_acc[model_checkpoint]=' * INT8 PREC {top1} FP8 PREC {top3} MIX PREC {top5}'.format(top1=acc_int8, top3=acc_fp8 ,top5=acc_mix8)
+                print(model_checkpoint,tp1_acc[model_checkpoint])
 
-            """analysis"""
-            reports_int8 = layerwise_error_analyse(
-                graph=ppq_quant_ir_INT8, running_device=CFG_DEVICE, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), 
-                dataloader=evaluator.dataset)
-            reports_fp8 = layerwise_error_analyse(
-                graph=ppq_quant_ir_FP8, running_device=CFG_DEVICE, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), 
-                dataloader=evaluator.dataset)    
+                del model_forward_function
+                del ppq_quant_ir_FP8
+                del executor
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # """analysis"""
+            # # reports_int8 = layerwise_error_analyse(
+            # #     graph=ppq_quant_ir_INT8, running_device=CFG_DEVICE, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), 
+            # #     dataloader=evaluator.dataset)
+            # # reports_fp8 = layerwise_error_analyse(
+            # #     graph=ppq_quant_ir_FP8, running_device=CFG_DEVICE, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), 
+            # #     dataloader=evaluator.dataset)    
             
-            np.save(model_checkpoint[-4:]+'_layer_int8_aligned',reports_int8)
-            np.save(model_checkpoint[-4:]+'_layer_fp8',reports_fp8)
-            reports_int8 = np.load(model_checkpoint[-4:]+'_layer_int8_aligned.npy',allow_pickle=True)
-            reports_fp8 = np.load(model_checkpoint[-4:]+'_layer_fp8.npy',allow_pickle=True)
-            reports_int8 = reports_int8.item()
-            reports_fp8 = reports_fp8.item()
+            # # np.save(model_checkpoint[-4:]+'_layer_int8_aligned',reports_int8)
+            # # np.save(model_checkpoint[-4:]+'_layer_fp8',reports_fp8)
+            # reports_int8 = np.load(model_checkpoint[-4:]+'_layer_int8_aligned.npy',allow_pickle=True)
+            # reports_fp8 = np.load(model_checkpoint[-4:]+'_layer_fp8.npy',allow_pickle=True)
+            # reports_int8 = reports_int8.item()
+            # reports_fp8 = reports_fp8.item()
 
             """set the final model"""
             #从大到小排序单层误差
-            # sensitivity = [(op_name, error) for op_name, error in reports.items()]
+            # sensitivity = [(op_name, error) for op_name, error in reports_int8.items()]
             # sensitivity = sorted(sensitivity, key=lambda x: x[1], reverse=True)
             op_cnt, fp_cnt= 0,0
             for op_name, _ in reports_int8.items():
                 if op_name not in reports_fp8:
                     continue
                 op_cnt += 1
+                # print(op_name, reports_int8[op_name]<reports_fp8[op_name])
                 if reports_int8[op_name]>reports_fp8[op_name]:
                     QUANT_SETTING.dispatching_table.append(operation=op_name, platform=TargetPlatform.TRT_FP8)
                     fp_cnt += 1
-            tp1_acc[model_checkpoint]=' * op cnt {top1} fp cnt {top5}'.format(top1=op_cnt, top5=fp_cnt)
+            tp1_acc[model_checkpoint]=' * op cnt {top1} fp cnt {top5} fp percent {pct}'.format(
+                top1=op_cnt, top5=fp_cnt, pct=fp_cnt/op_cnt)
+            print(model_checkpoint,tp1_acc[model_checkpoint])
 
             # 将前十个误差最大的层送上 FP32
             # for op_name, _ in sensitivity[: 5]:
-            #     QUANT_SETTING.dispatching_table.append(operation=op_name, platform=TargetPlatform.FP32)
+            #     print(op_name)
+            #     QUANT_SETTING.dispatching_table.append(operation=op_name, platform=TargetPlatform.TRT_FP8)
 
             ppq_quant_ir = quantize_torch_model(
                 model=model_fp16, calib_dataloader=evaluator.dataset.shuffle(seed=29).select(range(100)), input_shape=input_ids.shape, input_dtype=input_ids.dtype,
@@ -205,19 +265,28 @@ with ENABLE_CUDA_KERNEL():
             model_forward_function = lambda input_tensor: torch.tensor(
                 executor(*[input_tensor])[0])
             acc_mix8 = evaluator.evaluate_ppq(model_forward_function)
-            tp1_acc[model_checkpoint]=' * INT8 PREC {top1} FP8 PREC {top3} MIX PREC {top5}'.format(top1=acc_int8, top3=acc_fp8 ,top5=acc_mix8)
+            tp1_acc[model_checkpoint]=' *  MIX PREC {top5}'.format(top5=acc_mix8)
             print(model_checkpoint,tp1_acc[model_checkpoint])
 
-            """output"""
+            tp1_acc[model_checkpoint]=' * INT8 PREC {top1} FP8 PREC {top3} MIX PREC {top5}'.format(top1=acc_int8, top3=acc_fp8 ,top5=acc_mix8)
+            print(model_checkpoint,tp1_acc[model_checkpoint])
+            
+            del model_forward_function
+            del ppq_quant_ir
+            del executor
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            del model_fp16
+            del evaluator
+            del tokenizer
+            del input_ids
+            gc.collect()
+            torch.cuda.empty_cache()
             # export_ppq_graph(
             #     graph=ppq_quant_ir, 
             #     platform=TargetPlatform.ONNXRUNTIME,
             #     graph_save_to=f'{os.path.join(CFG_DUMP_PATH, model_name)}.onnx')
-            
-            # evaluate_onnx_module_with_imagenet(
-            #     onnxruntime_model_path=f'{os.path.join(CFG_DUMP_PATH, model_name)}.onnx', 
-            #     imagenet_validation_dir=CFG_VALIDATION_DIR, batchsize=CFG_BATCHSIZE, 
-            #     device=CFG_DEVICE)
 
         print(tp1_acc)
     else:

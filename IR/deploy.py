@@ -76,6 +76,7 @@ class RunnableGraph(GraphCommandProcessor):
 
     def deploy(self, device: str):
 
+        # GPUtil.showUtilization(all=True)
         for _, operator in self._graph.operations.items():
             assert isinstance(operator, Operation), \
                 f'Failed to send graph to device, incorrect operator {operator} found.'
@@ -98,8 +99,24 @@ class RunnableGraph(GraphCommandProcessor):
                 for cfg, var in operator.config_with_variable:
                     if isinstance(cfg._scale, torch.Tensor): cfg._scale = cfg._scale.to(device)
                     if isinstance(cfg._offset, torch.Tensor): cfg._offset = cfg._offset.to(device)
+            # print("operator ",  _,  device,
+            #             torch.cuda.get_device_capability(device), # 查看指定GPU容量
+            #             torch.cuda.get_device_name(device) # 查看指定GPU名称
+            #         )
 
+        length = len(self._graph.variables)
+        cuda_num = torch.cuda.device_count()
+        block = length // cuda_num
+        # GPUtil.showUtilization(all=True)
+        flag, blockidx=0, 0
+        device = "cuda:"+str(blockidx)
         for _, variable in self._graph.variables.items():
+            flag+=1
+            if flag > block:
+                flag = 0
+                blockidx = (blockidx + 1) % cuda_num
+                device = "cuda:"+str(blockidx)
+                # print(device)
             assert isinstance(variable, Variable), \
                 f'Failed to send graph to device, incorrect variable {variable} found.'
             # graph output variable has no destinations
@@ -135,4 +152,8 @@ class RunnableGraph(GraphCommandProcessor):
                     if socket.in_plat[dest_idx] == TargetPlatform.SOI:
                         variable.value = convert_any_to_torch_tensor(
                             variable.value, accept_none=True).to('cpu')
+            
+            # print("variable ",_,device)
+        # print("In deploy")
+        # GPUtil.showUtilization(all=True)
         return self

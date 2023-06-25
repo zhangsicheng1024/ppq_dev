@@ -27,9 +27,7 @@ from transformers.models.opt.modeling_opt import OPTAttention, OPTDecoderLayer, 
 from transformers import GPT2Tokenizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import torch.nn.functional as F
-
-from lm_eval.base import MultipleChoiceTask
+import transformers
 
 # PPQ_CONFIG.PPQ_DEBUG=True
 
@@ -40,6 +38,7 @@ CFG_VALIDATION_DIR = '/data/val'   # 用来读取 validation dataset
 CFG_TRAIN_DIR = '/data/train'        # 用来读取 train dataset，注意该集合将被用来 calibrate 你的模型
 CFG_PLATFORM = TargetPlatform.TRT_FP8     # 用来指定目标平台
 # CFG_PLATFORM = TargetPlatform.PPL_CUDA_INT8  
+# CFG_PLATFORM = TargetPlatform.FP32
 CFG_DUMP_PATH = 'Output/'                      # 所有模型保存的路径名
 QUANT_SETTING = QuantizationSettingFactory.default_setting() # 用来指定量化配置
 
@@ -56,7 +55,7 @@ QUANT_SETTING = QuantizationSettingFactory.default_setting() # 用来指定量�
 # QUANT_SETTING.lsq_optimization_setting.is_scale_trainable = True
 # QUANT_SETTING.lsq_optimization_setting.collecting_device  = 'cpu'
 model_list=[
-    'facebook/opt-125m',
+    # 'facebook/opt-125m',
     # 'facebook/opt-350m',
     # 'facebook/opt-1.3b',
     # 'facebook/opt-2.7b',
@@ -64,153 +63,26 @@ model_list=[
     # 'facebook/opt-13b',
     # 'facebook/opt-30b',
     # 'facebook/opt-66b',
+    "decapoda-research/llama-7b-hf",
 ]
 # seq = ["input_ids", "attention_mask", "token_type_ids", 
 #         "position_ids", "head_mask", "inputs_embeds", 
 #         "labels","output_attentions","output_hidden_states"]
 tp1_acc={}
-
 class Evaluator:
-    def __init__(self, dataset, tokenizer, device, _model_call):
+    def __init__(self, dataset, tokenizer, device):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.device = device
-        self._model_call=_model_call
 
-        def set_padding(examples):
-            goal_len = max(len(elem) for elem in examples['goal'])
-            choice1_len = max(len(elem) for elem in examples['sol1'])
-            choice2_len = max(len(elem) for elem in examples['sol2'])
-            self.padding_length = max(goal_len+choice1_len,goal_len+choice2_len)+20
-            return None
-        self.dataset.map(set_padding, batched=True)
-        
+        # tokenize the dataset
         def tokenize_function(examples):
-            out_doc = self._process_doc(examples)
-            out_doc['context_enc'] = self.tokenizer(self.doc_to_text(out_doc),truncation=True)
-            out_doc['continuation_enc1'] = self.tokenizer(self.doc_to_target1(out_doc),truncation=True)
-            out_doc['continuation_enc2'] = self.tokenizer(self.doc_to_target2(out_doc),truncation=True)
-            return out_doc
-        
-        self.dataset = self.dataset.map(tokenize_function, batched=False)
-        print(self.padding_length, self.dataset[0])
-        # self.dataset.set_format(type='torch', columns=['input_ids','attention_mask','context_enc','continuation_enc'])
+            example = self.tokenizer(examples['text'],padding='longest',truncation=True)
+            return example
 
-
-    def doc_to_text(self, doc):
-        # print("Question: " + doc["goal"] + "\nAnswer:")
-        return "Question: " + doc["goal"] + "\nAnswer:"
-    def doc_to_target1(self, doc):
-        # print("target1 ", " " + doc["choices"][0])
-        return " " + doc["choices"][0]
-    def doc_to_target2(self, doc):
-        # print("target2 ", " " + doc["choices"][1])
-        return " " + doc["choices"][1]
-    def _process_doc(self, doc):
-        out_doc = {
-            "goal": doc["goal"],
-            "choices": [doc["sol1"], doc["sol2"]],
-            "gold": doc["label"],
-        }
-        return out_doc
-    def _loglikelihood_tokens(self, context_enc, continuation_enc, foward_func=None, sample=False):
-
-        padding_length = self.padding_length
-
-        # because vectorizing is annoying, we first convert each (context, continuation) pair to padded
-        # tensors, then we pack them together into a batch, call the model, and then pick it all apart
-        # again because vectorizing is annoying
-
-        # sanity check
-        # assert len(context_enc) > 0
-        # assert len(continuation_enc) > 0
-
-        # print("enc shape ",len(context_enc),len(continuation_enc))
-        # print(context_enc,continuation_enc)
-        # how this all works:
-        #          CTX      CONT
-        # inp    0 1 2 3|4 5 6 7 8 9   <- last token is deleted by inp[:, :-1]
-        # gpt2    \               \
-        # logits   1 2 3|4 5 6 7 8 9   <- the ctx half gets tossed out by the
-        # cont_toks      4 5 6 7 8 9      [:, -len(continuation_enc):, :self.vocab_size] slice
-
-        # when too long to fit in context, truncate from the left
-        inp = torch.tensor(
-            (context_enc + continuation_enc)[:][:-1],
-            dtype=torch.long,
-        ).to(self.device)
-        (inplen,) = inp.shape
-
-        # print("inp.shape",inp.shape)
-
-        # since in _collate we make sure length is descending, the longest is always the first one.
-        padding_length = (
-            padding_length if padding_length is not None else inplen
-        )
-
-        # pad length from seq to padding_length
-        inp = torch.cat(
-            [
-                inp,  # [seq]
-                torch.zeros(padding_length - inplen, dtype=torch.long).to(
-                    inp.device
-                ),  # [padding_length - seq]
-            ],
-            dim=0,
-        )
-        inp = inp.unsqueeze(0)  # [1, padding_length]
-        cont_toks = continuation_enc
-
-        if sample:
-            return inp
-        if foward_func == None:
-            output = self._model_call(inp)
-            logits = F.log_softmax(
-                output.logits, dim=-1
-            ).cpu()  # [batch, padding_length, vocab]
-        else:
-            output = foward_func(inp)
-            logits = F.log_softmax(
-                output, dim=-1
-            ).cpu()  # [batch, padding_length, vocab]
-        # print("logits",output.logits.shape)
-
-        # Slice to original seq length
-        contlen = len(cont_toks)
-        # print(inplen,contlen)
-        # print(logits.shape,logits[:,inplen - contlen : inplen].shape)
-        logits = logits[:,inplen - contlen : inplen]  # [1, seq, vocab]
-
-        # Check if per-token argmax is exactly equal to continuation
-        greedy_tokens = logits.argmax(dim=-1)
-        # print("greedy_tokens.shape",greedy_tokens.shape)
-        cont_toks = torch.tensor(cont_toks, dtype=torch.long).unsqueeze(
-            0
-        )  # [1, seq]
-        max_equal = (greedy_tokens == cont_toks).all()
-
-        # Obtain log-probs at the corresponding continuation token indices
-        # last_token_slice = logits[:, -1, :].squeeze(0).tolist()
-        logits = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(
-            -1
-        )  # [1, seq]
-        # print("logits.shape",logits.shape)
-
-        # Answer: (log prob, is-exact-match)
-        answer = (float(logits.sum()), bool(max_equal))
-        # print("answer",answer)
-
-        return answer
-    
-    @torch.no_grad()
-    def sample_batch(self):
-        return torch.ones((1,self.padding_length),dtype=torch.int32)
-
-    def my_collate_fn(self, batch):
-        context_enc = batch['context_enc']['input_ids']
-        continuation_enc1 = batch['continuation_enc1']['input_ids']
-        input1 = self._loglikelihood_tokens(context_enc,continuation_enc1,sample=True)
-        return input1.to(self.device)
+        self.dataset = self.dataset.map(tokenize_function, batched=True)
+        # print(self.dataset[0])
+        self.dataset.set_format(type='torch', columns=['input_ids','attention_mask'])
 
     @torch.no_grad()
     def evaluate(self, model):
@@ -218,21 +90,18 @@ class Evaluator:
         # The task is to predict the last word of the input.
         total, hit = 0, 0
         for batch in self.dataset:
-            context_enc = batch['context_enc']['input_ids']
-            continuation_enc1 = batch['continuation_enc1']['input_ids']
-            continuation_enc2 = batch['continuation_enc2']['input_ids']
+            input_ids = batch['input_ids'].to(self.device).unsqueeze(0)
+            attention_mask = batch['attention_mask'].to(self.device).unsqueeze(0)
             # label = input_ids[:, -1]
-            # print("label",doc['gold'])
-            label = batch['gold']
+            label = input_ids[:,int(torch.sum(batch['attention_mask'])-1)]
             # outputs = model(input_ids,attention_mask=attention_mask)
-            outputs1 = self._loglikelihood_tokens(context_enc,continuation_enc1)[0]
-            outputs2 = self._loglikelihood_tokens(context_enc,continuation_enc2)[0]
-            # print(outputs1,outputs2)
+            outputs = model(input_ids)
+            last_token_logits = outputs.logits[:, int(torch.sum(batch['attention_mask'])-2), :]
             # print(torch.sum(last_token_logits),last_token_logits)
-            pred = 0 if outputs1 > outputs2 else 1
+            pred = last_token_logits.argmax(dim=-1)
             # print(pred, label)
-            total += 1
-            hit += pred == label
+            total += label.size(0)
+            hit += (pred == label).sum().item()
         acc = hit / total
         return acc
     
@@ -240,40 +109,40 @@ class Evaluator:
         # The task is to predict the last word of the input.
         total, hit = 0, 0
         for batch in self.dataset:
-            context_enc = batch['context_enc']['input_ids']
-            continuation_enc1 = batch['continuation_enc1']['input_ids']
-            continuation_enc2 = batch['continuation_enc2']['input_ids']
+            input_ids = batch['input_ids'].to(self.device).unsqueeze(0)
             # label = input_ids[:, -1]
-            # print("label",doc['gold'])
-            label = batch['gold']
-            # outputs = model(input_ids,attention_mask=attention_mask)
-            outputs1 = self._loglikelihood_tokens(context_enc,continuation_enc1,foward_func=fw_func)[0]
-            outputs2 = self._loglikelihood_tokens(context_enc,continuation_enc2,foward_func=fw_func)[0]
-            # print(outputs1,outputs2)
-            # print(torch.sum(last_token_logits),last_token_logits)
-            pred = 0 if outputs1 > outputs2 else 1
+            label = input_ids[:,int(torch.sum(batch['attention_mask'])-1)]
+            outputs = fw_func(input_ids)
+            # print(outputs.shape)
+            last_token_logits = outputs[:, int(torch.sum(batch['attention_mask'])-2), :]
+            pred = last_token_logits.argmax(dim=-1)
             # print(pred, label)
-            total += 1
-            hit += pred == label
+            pred = pred.to(self.device)
+            total += label.size(0)
+            hit += (pred == label).sum().item()
         acc = hit / total
         return acc
 
 with ENABLE_CUDA_KERNEL():
     if __name__ == '__main__':
 
-        dataset = load_dataset('piqa', split='validation')
-        dataset = dataset.shuffle(seed=42).select(range(1000))
+        dataset = load_dataset('lambada', split='validation')
+        dataset = dataset.shuffle(seed=42).select(range(20))
         print(len(dataset),dataset[0])
 
-
         for model_checkpoint in model_list:
-            model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32, device_map="balanced_low_0") #.cuda()
-            # model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32).cuda()
-            print(model_fp16.hf_device_map,model_fp16.dtype)
+            # gpu_tracker.track()     
+            model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32, device_map="auto") #.cuda()
+            print(model_fp16.hf_device_map)
+            # model_fp16 = transformers.LlamaForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32).cuda()
+            # gpu_tracker.track()     
 
             """Preprocessing the data"""
-            tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, use_fast=False)
-            evaluator = Evaluator(dataset, tokenizer, CFG_DEVICE, model_fp16)
+            # tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, use_fast=False)
+            tokenizer = transformers.LlamaTokenizer.from_pretrained(model_checkpoint)
+            tokenizer.pad_token = "[PAD]"
+            # evaluator = Evaluator(dataset, tokenizer, CFG_DEVICE)
+            evaluator = Evaluator(dataset, tokenizer, CFG_DEVICE)
 
             # tokenized_datasets = tokenized_datasets.remove_columns([sentence1_key])
             # if sentence2_key is not None:
@@ -293,18 +162,22 @@ with ENABLE_CUDA_KERNEL():
             print(model_checkpoint,tp1_acc[model_checkpoint])
 
             """quantize"""
-            batch = evaluator.sample_batch()
+            for batch in evaluator.dataset:
+                break
             # input_list = [k for k in batch if k!="labels" ]
             # collate_fn  = lambda x: {k:x[k].cuda() for k in input_list}
-            input_ids = batch.to(CFG_DEVICE)
+            # gpu_tracker.track() 
+            input_ids = batch['input_ids'].to(CFG_DEVICE).unsqueeze(0)
             ppq_quant_ir = quantize_torch_model(
-                model=model_fp16, calib_dataloader=evaluator.dataset.shuffle(seed=29).select(range(100)), input_shape=input_ids.shape, input_dtype=input_ids.dtype,
+                model=model_fp16, calib_dataloader=evaluator.dataset.shuffle(seed=29).select(range(20)), input_shape=input_ids.shape, input_dtype=input_ids.dtype,
                 # model=model_fp16, calib_dataloader=evaluator.dataset, input_shape=input_ids.shape, input_dtype=input_ids.dtype,
-                calib_steps=100, collate_fn=evaluator.my_collate_fn, verbose=1,
+                calib_steps=20, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), verbose=1,
                 device=CFG_DEVICE, platform=CFG_PLATFORM, setting=QUANT_SETTING)
+            # gpu_tracker.track() 
 
             """evaluate"""
             executor = TorchExecutor(graph=ppq_quant_ir, device=CFG_DEVICE)
+            # gpu_tracker.track() 
             model_forward_function = lambda input_tensor: torch.tensor(
                 executor(*[input_tensor])[0])
             acc_fp8 = evaluator.evaluate_ppq(model_forward_function)

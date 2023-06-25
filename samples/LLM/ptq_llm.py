@@ -1,3 +1,5 @@
+import os
+os.environ['TRANSFORMERS_CACHE'] = '/mnt/cache/huggingface/'
 import torchvision
 from ppq import *
 from ppq.api import *
@@ -25,8 +27,10 @@ import numpy as np
 import torch
 from transformers.models.opt.modeling_opt import OPTAttention, OPTDecoderLayer, OPTForCausalLM
 from transformers import GPT2Tokenizer
+import transformers
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from accelerate import infer_auto_device_map
 
 # PPQ_CONFIG.PPQ_DEBUG=True
 
@@ -38,7 +42,19 @@ CFG_TRAIN_DIR = '/data/train'        # 用来读取 train dataset，注意该集
 CFG_PLATFORM = TargetPlatform.TRT_FP8     # 用来指定目标平台
 # CFG_PLATFORM = TargetPlatform.PPL_CUDA_INT8  
 CFG_DUMP_PATH = 'Output/'                      # 所有模型保存的路径名
+# CACHE_DIR = ''
 QUANT_SETTING = QuantizationSettingFactory.default_setting() # 用来指定量化配置
+# device_map={'model.decoder.embed_tokens': 0, 'lm_head': 0, 'model.decoder.embed_positions': 0, 'model.decoder.final_layer_norm': 0, 'model.decoder.layers.0.self_attn': 0,
+#  'model.decoder.layers.0.activation_fn': 0, 'model.decoder.layers.0.self_attn_layer_norm': 0, 'model.decoder.layers.0.fc1': 0, 'model.decoder.layers.0.fc2': 0, 'model.decoder.layers.0.final_layer_norm': 0, 
+#  'model.decoder.layers.1': 1, 'model.decoder.layers.2': 1, 'model.decoder.layers.3': 1, 'model.decoder.layers.4': 1, 'model.decoder.layers.5': 1, 'model.decoder.layers.6': 1, 
+#  'model.decoder.layers.7': 1, 'model.decoder.layers.8': 1, 'model.decoder.layers.9': 1, 'model.decoder.layers.10': 1, 'model.decoder.layers.11': 1, 'model.decoder.layers.12': 1, 
+#  'model.decoder.layers.13': 1, 'model.decoder.layers.14': 1, 'model.decoder.layers.15': 1, 'model.decoder.layers.16': 1, 'model.decoder.layers.17': 1, 
+#  'model.decoder.layers.18.self_attn': 1, 'model.decoder.layers.18.activation_fn': 1, 'model.decoder.layers.18.self_attn_layer_norm': 1,'model.decoder.layers.18.fc1': 2, 'model.decoder.layers.18.fc2': 2, 'model.decoder.layers.18.final_layer_norm': 2, 
+#  'model.decoder.layers.19': 2, 'model.decoder.layers.20': 2, 'model.decoder.layers.21': 2, 'model.decoder.layers.22': 2, 'model.decoder.layers.23': 2, 'model.decoder.layers.24': 2, 
+#  'model.decoder.layers.25': 2, 'model.decoder.layers.26': 2, 'model.decoder.layers.27': 2, 'model.decoder.layers.28': 2, 'model.decoder.layers.29': 2, 'model.decoder.layers.30': 2, 
+#  'model.decoder.layers.31': 2, 'model.decoder.layers.32': 2, 'model.decoder.layers.33': 2, 'model.decoder.layers.34': 2, 'model.decoder.layers.35': 2, 'model.decoder.layers.36': 2, 
+#  'model.decoder.layers.37': 2, 'model.decoder.layers.38': 2, 'model.decoder.layers.39': 2, 'model.decoder.layers.40': 2, 'model.decoder.layers.41': 2, 'model.decoder.layers.42': 2, 
+#  'model.decoder.layers.43': 3, 'model.decoder.layers.44': 4, 'model.decoder.layers.45': 5, 'model.decoder.layers.46': 6, 'model.decoder.layers.47': 7}
 
 """QAT setting"""
 # ------------------------------------------------------------
@@ -61,6 +77,11 @@ model_list=[
     # 'facebook/opt-13b',
     # 'facebook/opt-30b',
     # 'facebook/opt-66b',
+
+    # "decapoda-research/llama-7b-hf",
+    # "decapoda-research/llama-13b-hf",
+
+    # "/workspace/llama-7b-hf/",
     # "decapoda-research/llama-7b-hf",
 ]
 # seq = ["input_ids", "attention_mask", "token_type_ids", 
@@ -73,14 +94,25 @@ class Evaluator:
         self.tokenizer = tokenizer
         self.device = device
 
+        # def set_padding(examples):
+        #     goal_len = max(len(elem) for elem in examples['goal'])
+        #     choice1_len = max(len(elem) for elem in examples['sol1'])
+        #     choice2_len = max(len(elem) for elem in examples['sol2'])
+        #     self.padding_length = max(goal_len+choice1_len,goal_len+choice2_len)+20
+        #     return None
+        
+
         # tokenize the dataset
         def tokenize_function(examples):
             example = self.tokenizer(examples['text'],padding='longest',truncation=True)
+            print(max(len(elem) for elem in example['input_ids']))
+            print(len(example['input_ids']),[len(e) for e in example['input_ids']])
             return example
 
-        self.dataset = self.dataset.map(tokenize_function, batched=True)
-        # print(self.dataset[0])
+        self.dataset = self.dataset.map(tokenize_function, batched=True, 
+                batch_size=len(self.dataset))
         self.dataset.set_format(type='torch', columns=['input_ids','attention_mask'])
+        print(self.dataset[0],len(self.dataset[0]['input_ids']),len(self.dataset[1]['input_ids']))
 
     @torch.no_grad()
     def evaluate(self, model):
@@ -124,17 +156,45 @@ with ENABLE_CUDA_KERNEL():
     if __name__ == '__main__':
 
         dataset = load_dataset('lambada', split='validation')
-        dataset = dataset.shuffle(seed=42).select(range(50))
+        # dataset = dataset.shuffle(seed=42).select(range(1000))
+        # dataset = dataset.select(range(len(dataset)))
         print(len(dataset),dataset[0])
 
         for model_checkpoint in model_list:
-            model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32).cuda()
-            # model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32, device_map="auto") #.cuda()
-            # print(model_fp16.hf_device_map)
+            # tokenizer = transformers.LlamaTokenizer.from_pretrained(model_checkpoint)
+            # tokenizer.pad_token = "[PAD]"
+            model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32, device_map="auto") #.cuda()
+            # model_fp16_cpu = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32)
+            print(model_fp16.hf_device_map)
+            # model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32).cuda()
+
+            tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, use_fast=False)
+            # device_map = infer_auto_device_map(model_fp16,max_memory = {0: "23GIB", 1: "23GIB", 2: "23GIB", 3: "23GIB", 4: "23GIB", 5: "23GIB", 6: "23GIB", 7: "23GIB"})
+            # del model_fp16
+            # print(device_map)
+            # model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32, device_map=device_map) #.cuda()
+            # model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32).cuda()
+            # print(model_fp16)
+            # print("model map: ",model_fp16.hf_device_map, model_fp16.dtype)
+            # print("infer_auto_device_map: ",infer_auto_device_map(model_fp16))
+
 
             """Preprocessing the data"""
-            tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, use_fast=False)
+            # tokenizer = AutoTokenizer.from_pretrained(model_checkpoint, use_fast=False)
+            # evaluator = Evaluator(dataset, tokenizer, CFG_DEVICE)
             evaluator = Evaluator(dataset, tokenizer, CFG_DEVICE)
+
+            # tokenized_datasets = tokenized_datasets.remove_columns([sentence1_key])
+            # if sentence2_key is not None:
+            #     tokenized_datasets = tokenized_datasets.remove_columns([sentence2_key])
+            # tokenized_datasets = tokenized_datasets.remove_columns(["idx"])
+            # tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
+            # tokenized_datasets.set_format("torch")
+            # print("dataset len: ",len(tokenized_datasets["train"]),len(tokenized_datasets["validation_matched"]))
+            # small_train_dataset = tokenized_datasets["train"].shuffle(seed=42).select(range(1600))
+            # small_eval_dataset = tokenized_datasets["validation_matched"].shuffle(seed=42).select(range(8000))
+            # train_dataloader = DataLoader(small_train_dataset, shuffle=True, batch_size=CFG_BATCHSIZE)
+            # eval_dataloader = DataLoader(small_eval_dataset, batch_size=CFG_BATCHSIZE)
 
             """Eval the original model"""
             acc_fp16 = evaluator.evaluate(model_fp16)
@@ -144,12 +204,29 @@ with ENABLE_CUDA_KERNEL():
             """quantize"""
             for batch in evaluator.dataset:
                 break
+            # input_list = [k for k in batch if k!="labels" ]
+            # collate_fn  = lambda x: {k:x[k].cuda() for k in input_list}
             input_ids = batch['input_ids'].to(CFG_DEVICE).unsqueeze(0)
+            # model_fp16.eval()
+            # torch.onnx.export(
+            #     model=model_fp16, args=input_ids, 
+            #     verbose=True, f='gpu.model', opset_version=11,
+            # )
+            # model_fp16_cpu.eval()
+            # input_ids = input_ids.to('cpu')
+            # torch.onnx.export(
+            #     model=model_fp16_cpu, args=input_ids, 
+            #     verbose=True, f='cpu.model', opset_version=11,
+            # )
+            # break
+            print("calib dataset ",[len(data['input_ids']) for data in evaluator.dataset.shuffle(seed=29).select(range(100))])
+            
+
             ppq_quant_ir = quantize_torch_model(
-                model=model_fp16, calib_dataloader=evaluator.dataset.shuffle(seed=29).select(range(50)), input_shape=input_ids.shape, input_dtype=input_ids.dtype,
+                model=model_fp16, calib_dataloader=evaluator.dataset.shuffle(seed=29).select(range(20)), input_shape=input_ids.shape, input_dtype=input_ids.dtype,
                 # model=model_fp16, calib_dataloader=evaluator.dataset, input_shape=input_ids.shape, input_dtype=input_ids.dtype,
-                calib_steps=100, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), verbose=1,
-                device=CFG_DEVICE, platform=CFG_PLATFORM, setting=QUANT_SETTING)
+                calib_steps=20, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), verbose=1,
+                device=CFG_DEVICE, platform=CFG_PLATFORM, setting=QUANT_SETTING, onnx_export_file="onnx.model")
 
             """evaluate"""
             executor = TorchExecutor(graph=ppq_quant_ir, device=CFG_DEVICE)
@@ -191,7 +268,7 @@ with ENABLE_CUDA_KERNEL():
             #     calib_steps=100, collate_fn=lambda x: x['input_ids'].to(CFG_DEVICE).unsqueeze(0), verbose=1,
             #     device=CFG_DEVICE, platform=CFG_PLATFORM, setting=QUANT_SETTING)
 
-            """evaluate again"""
+            """evaluate"""
             # executor = TorchExecutor(graph=ppq_quant_ir, device=CFG_DEVICE)
             # model_forward_function = lambda input_tensor: torch.tensor(
             #     executor(*[input_tensor])[0])

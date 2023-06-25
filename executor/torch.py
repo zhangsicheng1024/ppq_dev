@@ -546,6 +546,8 @@ class TorchExecutor(BaseGraphExecutor, torch.nn.Module):
 
                 # invoking pre-forward hook
                 if operation_runtime_hook is not None:
+                    # print([(var.name,var.value.device,var.dtype) for var in operation.inputs])
+                    # print([(var.value.device) for var in operation.inputs])
                     if isinstance(operation_runtime_hook, QuantOPRuntimeHook):
                         inputs = operation_runtime_hook.pre_forward_hook(
                             inputs=[var.value for var in operation.inputs],
@@ -555,6 +557,14 @@ class TorchExecutor(BaseGraphExecutor, torch.nn.Module):
                     else: raise TypeError(f'invalid hook instance was given with operation: {operation}')
 
                 # forward and collecting result
+                # print(self._device,[inp.device for inp in inputs])
+                # inp_devices=[inp.device for inp in inputs]
+                # print(inp_devices)
+                # print(operation.name,operation.type,self._device)
+                # if len(inp_devices)>1 and inp_devices[0].type==inp_devices[1].type and inp_devices[0].index != inp_devices[1].index:
+                #     print("transfer inputs")
+                #     for inp in inputs:
+                #         inp.to(self._device)
                 outputs = operation_forward_func(operation, inputs, self._executing_context)
                 outputs = outputs if isinstance(outputs, (list, tuple)) else [outputs]
                 fp_outputs = outputs
@@ -591,6 +601,8 @@ class TorchExecutor(BaseGraphExecutor, torch.nn.Module):
                 if all(op in visited_op for op in var.dest_ops):
                     var.value = None
 
+        # print("In forward")
+        # GPUtil.showUtilization(all=True)
         # clear all variable(static clear).
         for var in self._graph.variables.values():
             if not var.is_parameter:

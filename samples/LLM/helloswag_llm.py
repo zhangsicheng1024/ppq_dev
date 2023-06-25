@@ -1,3 +1,5 @@
+import os
+os.environ['TRANSFORMERS_CACHE'] = '/mnt/cache/huggingface/'
 import torchvision
 from ppq import *
 from ppq.api import *
@@ -28,8 +30,9 @@ from transformers import GPT2Tokenizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch.nn.functional as F
+import re
+import numpy as np
 
-from lm_eval.base import MultipleChoiceTask
 
 # PPQ_CONFIG.PPQ_DEBUG=True
 
@@ -56,8 +59,8 @@ QUANT_SETTING = QuantizationSettingFactory.default_setting() # 用来指定量�
 # QUANT_SETTING.lsq_optimization_setting.is_scale_trainable = True
 # QUANT_SETTING.lsq_optimization_setting.collecting_device  = 'cpu'
 model_list=[
-    'facebook/opt-125m',
-    # 'facebook/opt-350m',
+    # 'facebook/opt-125m',
+    'facebook/opt-350m',
     # 'facebook/opt-1.3b',
     # 'facebook/opt-2.7b',
     # 'facebook/opt-6.7b',
@@ -76,43 +79,52 @@ class Evaluator:
         self.tokenizer = tokenizer
         self.device = device
         self._model_call=_model_call
-
-        def set_padding(examples):
-            goal_len = max(len(elem) for elem in examples['goal'])
-            choice1_len = max(len(elem) for elem in examples['sol1'])
-            choice2_len = max(len(elem) for elem in examples['sol2'])
-            self.padding_length = max(goal_len+choice1_len,goal_len+choice2_len)+20
-            return None
-        self.dataset.map(set_padding, batched=True)
         
         def tokenize_function(examples):
             out_doc = self._process_doc(examples)
             out_doc['context_enc'] = self.tokenizer(self.doc_to_text(out_doc),truncation=True)
-            out_doc['continuation_enc1'] = self.tokenizer(self.doc_to_target1(out_doc),truncation=True)
-            out_doc['continuation_enc2'] = self.tokenizer(self.doc_to_target2(out_doc),truncation=True)
+            out_doc['continuation_enc'] = self.tokenizer(self.doc_to_target(out_doc),truncation=True)
             return out_doc
         
         self.dataset = self.dataset.map(tokenize_function, batched=False)
-        print(self.padding_length, self.dataset[0])
         # self.dataset.set_format(type='torch', columns=['input_ids','attention_mask','context_enc','continuation_enc'])
 
+        def set_padding(examples):
+            # print(examples)
+            context_enc = max(len(elem['input_ids']) for elem in examples['context_enc'])
+            # print([max(map(len, ele['input_ids'])) for ele in examples['continuation_enc']])
+            continuation_enc = max([max(map(len, ele['input_ids'])) for ele in examples['continuation_enc'] ])
+            self.padding_length = context_enc+continuation_enc+20
+            print(context_enc,continuation_enc)
+            return None
+        self.dataset.map(set_padding, batched=True)
 
-    def doc_to_text(self, doc):
-        # print("Question: " + doc["goal"] + "\nAnswer:")
-        return "Question: " + doc["goal"] + "\nAnswer:"
-    def doc_to_target1(self, doc):
-        # print("target1 ", " " + doc["choices"][0])
-        return " " + doc["choices"][0]
-    def doc_to_target2(self, doc):
-        # print("target2 ", " " + doc["choices"][1])
-        return " " + doc["choices"][1]
+        print(self.padding_length, self.dataset[0])
+
     def _process_doc(self, doc):
+        ctx = doc["ctx_a"] + " " + doc["ctx_b"].capitalize()
         out_doc = {
-            "goal": doc["goal"],
-            "choices": [doc["sol1"], doc["sol2"]],
-            "gold": doc["label"],
+            "query": self.preprocess(doc["activity_label"] + ": " + ctx),
+            "choices": [" "+self.preprocess(ending) for ending in doc["endings"]],
+            "gold": int(doc["label"]),
         }
         return out_doc
+
+    def preprocess(self, text):
+        text = text.strip()
+        # NOTE: Brackets are artifacts of the WikiHow dataset portion of HellaSwag.
+        text = text.replace(" [title]", ". ")
+        text = re.sub("\\[.*?\\]", "", text)
+        text = text.replace("  ", " ")
+        return text
+
+    def doc_to_text(self, doc):
+        return doc["query"]
+
+    def doc_to_target(self, doc):
+        # print("target1 ", " " + doc["choices"][0])
+        return doc["choices"]
+
     def _loglikelihood_tokens(self, context_enc, continuation_enc, foward_func=None, sample=False):
 
         padding_length = self.padding_length
@@ -208,7 +220,7 @@ class Evaluator:
 
     def my_collate_fn(self, batch):
         context_enc = batch['context_enc']['input_ids']
-        continuation_enc1 = batch['continuation_enc1']['input_ids']
+        continuation_enc1 = batch['continuation_enc']['input_ids'][0]
         input1 = self._loglikelihood_tokens(context_enc,continuation_enc1,sample=True)
         return input1.to(self.device)
 
@@ -219,17 +231,13 @@ class Evaluator:
         total, hit = 0, 0
         for batch in self.dataset:
             context_enc = batch['context_enc']['input_ids']
-            continuation_enc1 = batch['continuation_enc1']['input_ids']
-            continuation_enc2 = batch['continuation_enc2']['input_ids']
-            # label = input_ids[:, -1]
-            # print("label",doc['gold'])
             label = batch['gold']
-            # outputs = model(input_ids,attention_mask=attention_mask)
-            outputs1 = self._loglikelihood_tokens(context_enc,continuation_enc1)[0]
-            outputs2 = self._loglikelihood_tokens(context_enc,continuation_enc2)[0]
-            # print(outputs1,outputs2)
-            # print(torch.sum(last_token_logits),last_token_logits)
-            pred = 0 if outputs1 > outputs2 else 1
+            outputs = []
+            for continuation_enc in batch['continuation_enc']['input_ids']:
+                output = self._loglikelihood_tokens(context_enc,continuation_enc)[0]
+                outputs.append(output)
+                # print(torch.sum(last_token_logits),last_token_logits)
+            pred = np.argmax(outputs)
             # print(pred, label)
             total += 1
             hit += pred == label
@@ -240,34 +248,32 @@ class Evaluator:
         # The task is to predict the last word of the input.
         total, hit = 0, 0
         for batch in self.dataset:
+
             context_enc = batch['context_enc']['input_ids']
-            continuation_enc1 = batch['continuation_enc1']['input_ids']
-            continuation_enc2 = batch['continuation_enc2']['input_ids']
-            # label = input_ids[:, -1]
-            # print("label",doc['gold'])
             label = batch['gold']
-            # outputs = model(input_ids,attention_mask=attention_mask)
-            outputs1 = self._loglikelihood_tokens(context_enc,continuation_enc1,foward_func=fw_func)[0]
-            outputs2 = self._loglikelihood_tokens(context_enc,continuation_enc2,foward_func=fw_func)[0]
-            # print(outputs1,outputs2)
-            # print(torch.sum(last_token_logits),last_token_logits)
-            pred = 0 if outputs1 > outputs2 else 1
+            outputs = []
+            for continuation_enc in batch['continuation_enc']['input_ids']:
+                output = self._loglikelihood_tokens(context_enc,continuation_enc,foward_func=fw_func)[0]
+                outputs.append(output)
+                # print(torch.sum(last_token_logits),last_token_logits)
+            pred = np.argmax(outputs)
             # print(pred, label)
             total += 1
             hit += pred == label
+
         acc = hit / total
         return acc
 
 with ENABLE_CUDA_KERNEL():
     if __name__ == '__main__':
 
-        dataset = load_dataset('piqa', split='validation')
-        dataset = dataset.shuffle(seed=42).select(range(1000))
+        dataset = load_dataset('hellaswag', split='validation')
+        dataset = dataset.shuffle(seed=42).select(range(10000))
         print(len(dataset),dataset[0])
 
 
         for model_checkpoint in model_list:
-            model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32, device_map="balanced_low_0") #.cuda()
+            model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32, device_map="auto") #.cuda()
             # model_fp16 = AutoModelForCausalLM.from_pretrained(model_checkpoint, torch_dtype=torch.float32).cuda()
             print(model_fp16.hf_device_map,model_fp16.dtype)
 
@@ -292,7 +298,7 @@ with ENABLE_CUDA_KERNEL():
             tp1_acc[model_checkpoint]=' * FP16 PREC {top1} '.format(top1=acc_fp16)
             print(model_checkpoint,tp1_acc[model_checkpoint])
 
-            """quantize"""
+            # """quantize"""
             batch = evaluator.sample_batch()
             # input_list = [k for k in batch if k!="labels" ]
             # collate_fn  = lambda x: {k:x[k].cuda() for k in input_list}
