@@ -4,5 +4,14 @@
 **/*.out
 **/*.csv
 **/*.model
+**/*.npy
 __pycache__/
 /build
+*_attr__value
+model.**.weight
+model.**.bias
+onnx__**
+out.txt
+log*.txt
+onnx*.txt
+gpu_mem*.txt
